@@ -73,6 +73,9 @@ int main (int argc, char *argv[])
 	//	Read in and process the equation of state file
 	inOut.InitializeEOS();
 
+	//	Build the per-flavor Romatschke-Strickland Lambda(energy density) tables
+	inOut.InitializeMomentumDistribution();
+
 	//  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 	// 	This is a test that records the mass of quark pairs and their relevent Qs
 	ofstream quark_output;

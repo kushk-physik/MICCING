@@ -1,0 +1,20 @@
+# build products
+*.o
+iccing
+
+# editor / OS / tool files
+.DS_Store
+.vscode/
+.claude/
+
+# run outputs
+run.log
+*eccentricities*.dat
+densities*.dat
+ta*.dat
+quark_counts.dat
+quark_list.dat
+run_parameters*.dat
+Input/TA*.dat
+Input/TB*.dat
+Input/ic*.dat

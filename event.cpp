@@ -58,6 +58,7 @@ void Event::CopyEvent(const Event &e)
   quark_dist = e.quark_dist;
   valued_points = e.valued_points;
   eccentricities = e.eccentricities;
+  quark_list = e.quark_list;
   ecc = e.ecc;
   number_gluon = e.number_gluon;
   number_up = e.number_up;
@@ -93,7 +94,7 @@ Event& Event::operator= (const Event& original)
 //##########################################################################################
 Sample Event::GetGlue()
 {
-  double q_s, e_tot;
+  double q_s = 0, e_tot = 0;
   Sample samp;
   int total_points = 0;
 
@@ -237,14 +238,25 @@ bool Event::UpdateDensity(Quarks quark_density)
     if (antiquark_bounds[0] - antiquark_bounds[2] < quark_dist.size() || antiquark_bounds[1] - antiquark_bounds[3] < quark_dist.size())
     { return false; }
 
+    double flavor_id = 0;
     if (quark_density.GetCharge()[0] == 0.0023)
-    { number_up++; }
+    { number_up++; flavor_id = 1; }
     else if (quark_density.GetCharge()[0] == 0.0048)
-    { number_down++; }
+    { number_down++; flavor_id = 2; }
     else if (quark_density.GetCharge()[0] == 0.095)
-    { number_strange++; }
+    { number_strange++; flavor_id = 3; }
     else if (quark_density.GetCharge()[0] == 1.29)
-    { number_charm++; }
+    { number_charm++; flavor_id = 4; }
+
+    //  Record individual quark and antiquark for per-quark output
+    //  gluon_x/gluon_y (pre-split center) and alpha are stored on both rows of the pair so the
+    //  parent gluon's momentum can later be sampled once and split between them (momentum conservation)
+    quark_list.push_back({ (double)quark_x, (double)quark_y, flavor_id, quark_density.GetCharge()[0],
+                            quark_density.GetCharge()[1], quark_density.GetCharge()[2], quark_density.GetCharge()[3], 0.,
+                            (double)x_center, (double)y_center, quark_density.GetAlpha() });
+    quark_list.push_back({ (double)antiquark_x, (double)antiquark_y, flavor_id, quark_density.GetCharge()[0],
+                            -quark_density.GetCharge()[1], -quark_density.GetCharge()[2], -quark_density.GetCharge()[3], 1.,
+                            (double)x_center, (double)y_center, quark_density.GetAlpha() });
 
     //******************************************************************************************
     //  Update Total energies and initial_energy
@@ -414,9 +426,15 @@ void Event::CleanEvent()
   gluon_dist.clear();
   quark_dist.clear();
   eccentricities.clear();
+  quark_list.clear();
   ecc.CleanEccentricity();
 
   total_initial_energy = 0;
   total_energy = 0;
+  number_gluon = 0;
+  number_up = 0;
+  number_down = 0;
+  number_strange = 0;
+  number_charm = 0;
 }
 //__________________________________________________________________________________________

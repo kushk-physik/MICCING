@@ -1,4 +1,6 @@
 #include "io.h"
+#include <gsl/gsl_integration.h>
+#include <gsl/gsl_errno.h>
 
 //__________________________________________________________________________________________
 //##########################################################################################
@@ -134,6 +136,8 @@ void IO::CopyIO(const IO &e)
 
   a_trento = e.a_trento;
   s_chop = e.s_chop;
+  eos_interped = e.eos_interped;
+  temp_from_energy = e.temp_from_energy;
 
   grid_max = e.grid_max;
   grid_step = e.grid_step;
@@ -353,14 +357,13 @@ Event IO::InitializeEvent()
   //  Loop through only points in radius of gluon and set to 1
   for (int i = -event_in.gluon_rad; i <= event_in.gluon_rad; i++) //  This goes -radius to radius in x
   {
-    // This calculates the hight of the gluon_dist at a given x-value
+    // This calculates the height of the gluon_dist at a given x-value
     int height = round(sqrt(event_in.gluon_rad*event_in.gluon_rad - i*i));
     for (int j = -height; j <= height; j++) //  This loops over the points in circle at given x
     {
       event_in.gluon_dist[i + ox][j + oy] = 1;  //  Set points in circle to 1 for calculations
     }
   }
-
 
   //******************************************************************************************
   //  Calculate Quark distribution for depositing densities
@@ -488,13 +491,35 @@ void IO::InitializeEOS()
   int length;
   input >> length;
 
+  //  heads up: the eos file header said 1993 rows but there were only 1992 actual data lines in it.
+  //  so the old for-loop (which trusted that header number) was reading past the end of the file for
+  //  the last row, and since failed reads just silently give you 0 in c++11+, it was quietly shoving
+  //  a fake (energy=0, entropy=0) point onto the end of the table, after entropy had already gone up
+  //  to like 1169. that broke the cubic spline because the spline solve is coupled across the whole
+  //  table, not just locally, so one garbage point at the end could mess with a bunch of it going
+  //  backward too. fix: stop trusting the header number for how many rows to read, just read until
+  //  the file actually runs out. didn't touch the data file itself, only this loop, so nothing else
+  //  that reads derv21.dat is affected.
   //******************************************************************************************
   //  For each line of EOS file add correlated energy, temperature, and entropy values to end
   //  of respective list
   //******************************************************************************************
-  for (int i = 0; i < length; i++)
+  //  old version, kept here commented out in case i need to go back to it - if so, just comment out
+  //  the while-loop below and uncomment this one.
+  //  for (int i = 0; i < length; i++)
+  //  {
+  //    input >> value;
+  //    energy.push_back(value);
+  //
+  //    input >> value;
+  //
+  //    input >> value;
+  //    entropy.push_back(value);
+  //
+  //    input >> value;
+  //  }
+  while (input >> value)
   {
-    input >> value;
     energy.push_back(value);
 
     input >> value;
@@ -509,7 +534,140 @@ void IO::InitializeEOS()
 
   //  Initialze Cubic Spline for use in converting initial condition from entropy to energy
   eos_interped = CubicSpline(entropy, energy);
+
+  //  Build energy -> temperature spline using T = de/ds = b coefficient at each knot
+  //  eos_interped[i].b is the first derivative (de/ds = T) at the i-th entropy knot
+  int n = eos_interped.size();
+  vector<double> energy_knots, temp_knots;
+  for (int i = 0; i < n; i++)
+  {
+    energy_knots.push_back(eos_interped[i].a);
+    temp_knots.push_back(eos_interped[i].b);
+  }
+  //  Add the final knot (right endpoint of last spline interval)
+  double ds_last = entropy.back() - eos_interped[n-1].x;
+  energy_knots.push_back(energy.back());
+  temp_knots.push_back(eos_interped[n-1].b + 2.0*eos_interped[n-1].c*ds_last + 3.0*eos_interped[n-1].d*ds_last*ds_last);
+
+  temp_from_energy = CubicSpline(energy_knots, temp_knots);
 }
+//__________________________________________________________________________________________
+
+//__________________________________________________________________________________________
+//##########################################################################################
+//  Romatschke-Strickland Lambda(energy density) integral helpers
+//    epsilon(Lambda) = g * Integral d^3p  E_real * exp(-E_stretched/Lambda), Boltzmann statistics
+//    E_real      = sqrt(pT^2 + pz^2 + m^2)          (actual on-shell energy, never stretched)
+//    E_stretched = sqrt(pT^2 + (1+xi)*pz^2 + m^2)   (only the probability weight is squeezed)
+//    Reduced analytically from 3D to 2D (pT, pz) using azimuthal symmetry and pz-parity;
+//    the remaining double integral has no closed form once m != 0, so it's done with GSL.
+//##########################################################################################
+struct RSIntegralParams { double m; double Lambda; double xi; double pz; };
+
+static double RS_pT_integrand(double pT, void *params)
+{
+  RSIntegralParams *p = (RSIntegralParams*)params;
+  double E_real = sqrt(pT*pT + p->pz*p->pz + p->m*p->m);
+  double E_stretched = sqrt(pT*pT + (1.0 + p->xi)*p->pz*p->pz + p->m*p->m);
+  return pT * E_real * exp(-E_stretched / p->Lambda);
+}
+
+static double RS_pz_integrand(double pz, void *params)
+{
+  RSIntegralParams *p = (RSIntegralParams*)params;
+  p->pz = pz;
+
+  gsl_function F;
+  F.function = &RS_pT_integrand;
+  F.params = p;
+
+  gsl_integration_workspace *w = gsl_integration_workspace_alloc(1000);
+  double result, error;
+  //  epsabs=1e-12 (not 0): once the integrand's decayed to ~0 (e.g. heavy quark, small Lambda),
+  //  demanding pure relative precision on a value that's essentially zero is impossible and GSL
+  //  aborts by default - an absolute floor lets it stop happily once the tail is truly negligible
+  int status = gsl_integration_qagiu(&F, 0.0, 1e-12, 1e-7, 1000, w, &result, &error);
+  gsl_integration_workspace_free(w);
+
+  if (status != GSL_SUCCESS) { result = 0.0; }
+
+  return result;
+}
+
+static double ComputeEpsilonOfLambda(double mass, double Lambda, double xi, double g)
+{
+  RSIntegralParams params = {mass, Lambda, xi, 0.0};
+
+  gsl_function F;
+  F.function = &RS_pz_integrand;
+  F.params = &params;
+
+  gsl_integration_workspace *w = gsl_integration_workspace_alloc(1000);
+  double result, error;
+  int status = gsl_integration_qagiu(&F, 0.0, 1e-12, 1e-7, 1000, w, &result, &error);
+  gsl_integration_workspace_free(w);
+
+  if (status != GSL_SUCCESS) { result = 0.0; }
+
+  //  Factor of 2 from folding pz in (-inf,0] onto [0,inf) (integrand is even in pz),
+  //  factor of 2*pi from the trivial azimuthal (phi) integral
+  return g * 2.0 * 2.0 * M_PI * result;
+}
+//__________________________________________________________________________________________
+
+//__________________________________________________________________________________________
+//##########################################################################################
+//  Build the 4 per-flavor Lambda(energy density) lookup tables, fixed xi=4, Boltzmann statistics
+//  NOTE: flavor masses here must stay in sync with global.h's Charge struct (up/down/strange/charm)
+//##########################################################################################
+void IO::InitializeMomentumDistribution()
+{
+  //  don't let a single hard-to-reach-tolerance edge case (see RS_pz_integrand/ComputeEpsilonOfLambda)
+  //  abort the whole program - those two functions already check the return status themselves
+  gsl_set_error_handler_off();
+
+  const double xi = 4.0;
+  const double g = 6.0;              //  spin (2) x color (3) degeneracy for a single quark flavor
+  const int n_lambda = 150;
+  const double lambda_min = 0.02;    //  GeV
+  const double lambda_max = 2.5;     //  GeV
+
+  //  flavor_id=0 (mass=0) is the parent gluon itself - needed so its own momentum can be sampled
+  //  once per pair and split via alpha, instead of sampling the quark and antiquark independently
+  static const map<int,double> flavor_mass = { {0,0.0}, {1,0.0023}, {2,0.0048}, {3,0.095}, {4,1.29} };
+
+  for (map<int,double>::const_iterator it = flavor_mass.begin(); it != flavor_mass.end(); ++it)
+  {
+    int flavor_id = it->first;
+    double mass = it->second;
+
+    vector<double> energy_density_grid, lambda_grid;
+
+    for (int i = 0; i < n_lambda; i++)
+    {
+      //  Log-spaced so the low-energy-density tail (where Lambda changes fast) is well resolved
+      double Lambda = lambda_min * pow(lambda_max/lambda_min, (double)i/(n_lambda-1));
+      double eps = ComputeEpsilonOfLambda(mass, Lambda, xi, g);
+
+      energy_density_grid.push_back(eps);
+      lambda_grid.push_back(Lambda);
+    }
+
+    lambda_from_energy[flavor_id] = CubicSpline(energy_density_grid, lambda_grid);
+  }
+}
+//__________________________________________________________________________________________
+
+//__________________________________________________________________________________________
+//##########################################################################################
+//  Look up Lambda [GeV] for a given flavor and local energy density
+//##########################################################################################
+double IO::GetLambda(int flavor_id, double energy_density)
+{
+  SplineSet range = FindRange(lambda_from_energy[flavor_id], energy_density);
+  return InterpolateValue(range, energy_density);
+}
+//__________________________________________________________________________________________
 //__________________________________________________________________________________________
 
 //__________________________________________________________________________________________
@@ -633,11 +791,41 @@ void IO::OutputSparseDensityGrids(vector<vector<vector<double>>> &density_grid, 
       {
         x = -grid_max + i*grid_step;  //  Converts grid point to physical x-value
         y = -grid_max + j*grid_step;  //  Converts grid point to physical y-value
+
+        double e_cell = density_grid[0][i][j];
+        double baryon  = density_grid[1][i][j];
+        double strange = density_grid[2][i][j];
+
+        //  Effective quark mass [GeV] from charge content of cell
+        double m_eff;
+        if (abs(strange) > 1e-10)
+          m_eff = 0.095;   //  strange quark
+        else if (abs(baryon) > 1e-10)
+          m_eff = 0.0035;  //  light quark (avg up/down)
+        else
+          m_eff = 0.0;     //  gluon-dominated cell
+
+        //  Velocity: v = sqrt(1 - m^2/E^2), E_mean = 2.7*T (thermal average)
+        double velocity;
+        if (m_eff < 1e-15)
+        {
+          velocity = 1.0;  //  massless -> v = c
+        }
+        else
+        {
+          SplineSet range = FindRange(temp_from_energy, e_cell);
+          double T = InterpolateValue(range, e_cell);
+          double E_mean = 2.7 * T;
+          double ratio = m_eff / E_mean;
+          velocity = (ratio < 1.0) ? sqrt(1.0 - ratio * ratio) : 0.0;
+        }
+
         output << x << " " << y << " "
         << density_grid[0][i][j] << " "
         << density_grid[1][i][j] << " "
         << density_grid[2][i][j] << " "
-        << density_grid[3][i][j] << endl;
+        << density_grid[3][i][j] << " "
+        << velocity << endl;
       }
     }
   }
@@ -710,6 +898,144 @@ void IO::OutputQuarkCounts(double total_entropy, int gluon, int up, int down, in
   output.open(file_name, ios::app);  //  Append event to end of file
 
   output << current_event << " " << total_entropy << " " << gluon << " " << up << " " << down << " " << strange << " " << charm << endl;
+}
+//__________________________________________________________________________________________
+
+//__________________________________________________________________________________________
+//##########################################################################################
+//  Samples one (px,py,pz) from the Romatschke-Strickland distribution (Boltzmann stats, given
+//  xi) for a particle of the given mass and Lambda.
+//    Trick: f_RS(px,py,pz) is exactly an isotropic thermal Boltzmann distribution in the
+//    "primed" variable pz'=sqrt(1+xi)*pz. So: sample p'=sqrt(px^2+py^2+pz'^2) isotropically
+//    (rejection sampling against the radial thermal weight p'^2*exp(-E'/Lambda)), sample a
+//    random direction, then un-stretch pz = pz'/sqrt(1+xi) at the very end. px,py are untouched.
+//##########################################################################################
+static void SampleThermalMomentum(double mass, double Lambda, double xi, double &px, double &py, double &pz)
+{
+  //  Peak of p'^2*exp(-sqrt(p'^2+m^2)/Lambda), used to build a rejection-sampling envelope
+  double p_peak = sqrt(2.0*Lambda*(Lambda + sqrt(Lambda*Lambda + mass*mass)));
+  double E_peak = sqrt(p_peak*p_peak + mass*mass);
+  double f_max = p_peak*p_peak * exp(-E_peak/Lambda);
+  double p_cut = p_peak + 30.0*Lambda;  //  generous cutoff, exponential tail is negligible past this
+
+  uniform_real_distribution<double> get_p(0.0, p_cut);
+  uniform_real_distribution<double> get_reject(0.0, f_max);
+  uniform_real_distribution<double> get_costheta(-1.0, 1.0);
+  uniform_real_distribution<double> get_phi(0.0, 2.0*M_PI);
+
+  double p_prime = 0.0;
+  bool accepted = false;
+  while (!accepted)
+  {
+    double p_candidate = get_p(get_random_number);
+    double E_candidate = sqrt(p_candidate*p_candidate + mass*mass);
+    double f_val = p_candidate*p_candidate * exp(-E_candidate/Lambda);
+
+    if (get_reject(get_random_number) <= f_val)
+    {
+      p_prime = p_candidate;
+      accepted = true;
+    }
+  }
+
+  double costheta = get_costheta(get_random_number);
+  double sintheta = sqrt(1.0 - costheta*costheta);
+  double phi = get_phi(get_random_number);
+
+  double pT = p_prime * sintheta;
+  px = pT * cos(phi);
+  py = pT * sin(phi);
+  double pz_prime = p_prime * costheta;
+
+  pz = pz_prime / sqrt(1.0 + xi);  //  un-stretch back to the real beam-direction momentum
+}
+//__________________________________________________________________________________________
+
+//__________________________________________________________________________________________
+//##########################################################################################
+//  Samples ONE momentum for the parent gluon (flavor_id=0, mass=0) per pair, at its own
+//  pre-split position, then splits it via alpha between the quark (row i) and antiquark
+//  (row i+1) - so their momenta actually add back up to the gluon's, unlike sampling them
+//  independently. Must run after the event's density[0] grid is fully built (i.e. after
+//  CalculateEccentricities), not mid-event, since it needs the true local energy density.
+//##########################################################################################
+void IO::AssignPairMomentum(vector<vector<double>> &quark_list, vector<vector<double>> &energy_density_grid)
+{
+  const double xi = 4.0;
+
+  for (int i = 0; i < quark_list.size(); i += 2)
+  {
+    //  gluon_x/gluon_y/alpha (columns 8,9,10) are identical on the quark and antiquark row
+    int gluon_x = (int)quark_list[i][8];
+    int gluon_y = (int)quark_list[i][9];
+    double alpha = quark_list[i][10];
+
+    double e_local = energy_density_grid[gluon_x][gluon_y];
+
+    //  Defensive clamp: the gluon center can sit where the local cell value is below the
+    //  lowest energy density the Lambda table was built over
+    double e_min = lambda_from_energy[0].front().x;
+    if (e_local < e_min) { e_local = e_min; }
+
+    double Lambda_gluon = GetLambda(0, e_local);
+
+    double px_g, py_g, pz_g;
+    SampleThermalMomentum(0.0, Lambda_gluon, xi, px_g, py_g, pz_g);
+
+    //  Quark gets alpha's share, antiquark gets (1-alpha)'s share - same convention already
+    //  used for splitting the gluon's energy between them (Event::UpdateDensity)
+    double mass = quark_list[i][3];  //  same flavor mass on both rows
+
+    double px_q = alpha*px_g,       py_q = alpha*py_g,       pz_q = alpha*pz_g;
+    double px_a = (1.0-alpha)*px_g, py_a = (1.0-alpha)*py_g, pz_a = (1.0-alpha)*pz_g;
+
+    double E_q = sqrt(px_q*px_q + py_q*py_q + pz_q*pz_q + mass*mass);
+    double E_a = sqrt(px_a*px_a + py_a*py_a + pz_a*pz_a + mass*mass);
+
+    quark_list[i].push_back(Lambda_gluon);
+    quark_list[i].push_back(px_q); quark_list[i].push_back(py_q); quark_list[i].push_back(pz_q);
+    quark_list[i].push_back(px_q/E_q); quark_list[i].push_back(py_q/E_q); quark_list[i].push_back(pz_q/E_q);
+
+    quark_list[i+1].push_back(Lambda_gluon);
+    quark_list[i+1].push_back(px_a); quark_list[i+1].push_back(py_a); quark_list[i+1].push_back(pz_a);
+    quark_list[i+1].push_back(px_a/E_a); quark_list[i+1].push_back(py_a/E_a); quark_list[i+1].push_back(pz_a/E_a);
+  }
+}
+//__________________________________________________________________________________________
+
+//__________________________________________________________________________________________
+//##########################################################################################
+//  Print per-quark position, flavor, mass, charges, RS Lambda, momentum, and velocity
+//##########################################################################################
+void IO::OutputQuarkList(vector<vector<double>> &quark_list, string file_name)
+{
+  ofstream output;
+  output.open(file_name, ios::app);  //  Append event to end of file
+
+  string flavor_label;
+  double x, y, gluon_x, gluon_y;
+
+  for (int i = 0; i < quark_list.size(); i++)
+  {
+    x = -grid_max + quark_list[i][0]*grid_step;  //  Converts grid point to physical x-value
+    y = -grid_max + quark_list[i][1]*grid_step;  //  Converts grid point to physical y-value
+    gluon_x = -grid_max + quark_list[i][8]*grid_step;  //  Parent gluon's pre-split physical x-value
+    gluon_y = -grid_max + quark_list[i][9]*grid_step;  //  Parent gluon's pre-split physical y-value
+
+    if (quark_list[i][2] == 1) { flavor_label = "up"; }
+    else if (quark_list[i][2] == 2) { flavor_label = "down"; }
+    else if (quark_list[i][2] == 3) { flavor_label = "strange"; }
+    else if (quark_list[i][2] == 4) { flavor_label = "charm"; }
+
+    output << current_event << " " << x << " " << y << " " << flavor_label << " "
+           << quark_list[i][3] << " " << quark_list[i][4] << " " << quark_list[i][5] << " "
+           << quark_list[i][6] << " " << quark_list[i][7] << " "
+           << gluon_x << " " << gluon_y << " " << quark_list[i][10] << " " << quark_list[i][11] << " "
+           << quark_list[i][12] << " " << quark_list[i][13] << " " << quark_list[i][14] << " "
+           << quark_list[i][15] << " " << quark_list[i][16] << " " << quark_list[i][17] << endl;
+  }
+
+  output.close();
 }
 //__________________________________________________________________________________________
 
@@ -949,6 +1275,8 @@ void IO::WriteEvent(Event event)
   OutputEccentricities(event.total_initial_entropy, event.eccentricities[2], "Charge", output_dir + "strange_eccentricities");
   OutputEccentricities(event.total_initial_entropy, event.eccentricities[3], "Charge", output_dir + "charge_eccentricities");
   OutputQuarkCounts(event.total_initial_entropy, event.number_gluon, event.number_up, event.number_down, event.number_strange, event.number_charm, output_dir + "quark_counts.dat");
+  AssignPairMomentum(event.quark_list, event.density[0]);
+  OutputQuarkList(event.quark_list, output_dir + "quark_list.dat");
   current_event++;  //  Used for tracking which event has been processed
 }
 //__________________________________________________________________________________________

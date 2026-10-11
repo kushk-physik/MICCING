@@ -62,6 +62,7 @@ private:
   vector<vector<double>> quark_dist; //  Projectile Input Energy density
   vector<vector<int>> valued_points;
   vector<vector<vector<double>>> eccentricities;
+  vector<vector<double>> quark_list;  //  Records {x, y, flavor_id, mass, baryon, strangeness, charge, is_antiquark} per individual quark
   Eccentricity ecc;
   int number_gluon = 0;
   int number_up = 0;

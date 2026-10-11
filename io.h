@@ -123,6 +123,14 @@ private:
   double a_trento;
   double s_chop;
   vector<SplineSet> eos_interped;
+  vector<SplineSet> temp_from_energy;
+
+  //******************************************************************************************
+  //  Romatschke-Strickland momentum distribution parameters
+  //  lambda_from_energy[flavor_id] gives the Lambda(local energy density) spline for that flavor
+  //  (1=up, 2=down, 3=strange, 4=charm), built once at startup, at fixed xi=4, Boltzmann statistics
+  //******************************************************************************************
+  map<int, vector<SplineSet>> lambda_from_energy;
 
   //******************************************************************************************
   //  Multiple Use Config parameters
@@ -159,6 +167,11 @@ private:
   void OutputSparseDensityGrids(vector<vector<vector<double>>> &density_grid, double tot_energy, string file_name);  //  Only prints valued points
   void OutputEccentricities(double total_entropy, vector<vector<double>> eccentricities, string density_type, string file_name); //  Prints eccentricities
   void OutputQuarkCounts(double total_entropy, int gluon, int up, int down, int strange, int charm, string file_name); //  Prints quark counts
+  void OutputQuarkList(vector<vector<double>> &quark_list, string file_name); //  Prints per-quark position, flavor, mass, and charges
+  //  Samples ONE momentum for the parent gluon (flavor_id=0, mass=0) per pair, using its own
+  //  pre-split position, then splits it via alpha between the quark and antiquark rows so their
+  //  momenta actually conserve (replaces the old independent-per-row AssignQuarkLambda/AssignQuarkMomentum)
+  void AssignPairMomentum(vector<vector<double>> &quark_list, vector<vector<double>> &energy_density_grid);
 //__________________________________________________________________________________________
 
 public:
@@ -184,6 +197,10 @@ public:
   Splitter InitializeSplitter();
   // Initialize equation of state
   void InitializeEOS();
+  // Build the per-flavor Romatschke-Strickland Lambda(energy density) tables (xi=4, Boltzmann stats)
+  void InitializeMomentumDistribution();
+  // Look up Lambda [GeV] for a given flavor_id (1=up,2=down,3=strange,4=charm) and local energy density
+  double GetLambda(int flavor_id, double energy_density);
 
   string GetOutputDir() { return output_dir;  }
   string GetTest() { return test_;  }

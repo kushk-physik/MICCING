@@ -29,6 +29,7 @@ struct SplineSet{
       c = s.c;
       d = s.d;
       x = s.x;
+      return *this;
     }
 
 };
